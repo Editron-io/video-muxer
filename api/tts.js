@@ -1,34 +1,17 @@
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 
+// Formatting function ensuring parameters fit Microsoft's format requirements (+0%, -10%, etc.)
 function percent(value) {
   const n = Number(value);
-  if (!Number.isFinite(n)) return 0;
-  return Math.max(-100, Math.min(200, Math.round(n)));
+  if (!Number.isFinite(n)) return '+0%';
+  const snapped = Math.max(-100, Math.min(200, Math.round(n)));
+  return `${snapped >= 0 ? '+' : ''}${snapped}%`;
 }
 
 function pitch(value) {
   const n = Number(value);
-  if (!Number.isFinite(n)) return '0Hz';
+  if (!Number.isFinite(n)) return '+0Hz';
   return `${n >= 0 ? '+' : ''}${Math.max(-100, Math.min(100, Math.round(n)))}Hz`;
-}
-
-function collectStream(stream) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let settled = false;
-    const finish = (fn, value) => {
-      if (settled) return;
-      settled = true;
-      fn(value);
-    };
-    stream.on('data', chunk => chunks.push(Buffer.from(chunk)));
-    stream.once('end', () => finish(resolve, Buffer.concat(chunks)));
-    stream.once('error', error => finish(reject, error));
-  });
-}
-
-function escapeError(error) {
-  return error instanceof Error ? error.message : String(error ?? 'Unknown error');
 }
 
 export default async function handler(req, res) {
@@ -39,54 +22,68 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
+  let tts;
   try {
     const body = req.body || {};
     const text = typeof body.text === 'string' ? body.text.trim() : '';
     const voice = typeof body.voice === 'string' ? body.voice.trim() : '';
 
-    if (!text) return res.status(400).json({ error: 'Text is required.' });
-    if (!voice) return res.status(400).json({ error: 'Voice is required.' });
-    if (text.length > 50000) return res.status(413).json({ error: 'Text is too long. Maximum is 50,000 characters per request.' });
+    if (!text || !voice) {
+      return res.status(400).json({ error: 'Text and Voice parameters are required.' });
+    }
 
     const rate = percent(body.rate ?? 0);
     const voicePitch = pitch(body.pitch ?? 0);
 
-    // msedge-tts 2.x is maintained for the current Edge Read Aloud service and
-    // uses an Edge-compatible User-Agent on the server side.
-    const tts = new MsEdgeTTS({ enableLogger: false });
+    // Initializing the MS Edge WebSockets API wrapper
+    tts = new MsEdgeTTS({ enableLogger: false });
 
     await tts.setMetadata(
       voice,
       OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3,
-      {
-        wordBoundaryEnabled: false,
-        sentenceBoundaryEnabled: false
-      }
+      { wordBoundaryEnabled: false, sentenceBoundaryEnabled: false }
     );
 
+    // Stream generation handles
     const { audioStream } = tts.toStream(text, {
-      rate: rate / 100,
+      rate: rate,
       pitch: voicePitch,
-      volume: 0
+      volume: '+0%' // 🔧 FIXED: Changed from literal 0 to string format to fix the stalling bug
     });
 
-    try {
-      const audio = await collectStream(audioStream);
-      if (!audio.length) throw new Error('Microsoft Edge returned no audio data.');
+    // Write audio configurations instantly to client
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-store, no-transform');
 
-      res.setHeader('Content-Type', 'audio/mpeg');
-      res.setHeader('Content-Length', String(audio.length));
-      res.setHeader('Cache-Control', 'no-store, no-transform');
-      return res.status(200).send(audio);
-    } finally {
-      try { tts.close(); } catch {}
-    }
+    // 🏎️ SPEED FIX: Removed collectStream loop entirely.
+    // Instead, chunk data streams right back to the user instantly.
+    return new Promise((resolve) => {
+      audioStream.pipe(res);
+
+      audioStream.on('end', () => {
+        try { tts.close(); } catch {}
+        resolve();
+      });
+
+      audioStream.on('error', (error) => {
+        console.error('Streaming pipeline encountered an error:', error);
+        try { tts.close(); } catch {}
+        if (!res.headersSent) {
+          res.status(502).json({ error: 'Audio processing execution failed mid-transit.' });
+        }
+        resolve();
+      });
+    });
+
   } catch (error) {
-    console.error('Edge Neural TTS synthesis failed:', error);
-    return res.status(502).json({
-      error: 'Microsoft Edge Neural TTS failed.',
-      detail: escapeError(error),
-      hint: 'Check the selected voice and retry. The Vercel function uses the current Microsoft Edge Read Aloud protocol.'
-    });
+    console.error('Edge Neural TTS initialization failure:', error);
+    if (tts) { try { tts.close(); } catch {} }
+    
+    if (!res.headersSent) {
+      return res.status(502).json({
+        error: 'Microsoft Edge Neural TTS initialization failed.',
+        detail: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 }
