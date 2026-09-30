@@ -182,15 +182,102 @@ function renderInspector(){const it=state.timeline.find(x=>x.id===state.selected
 
 function loadPreview(m){if(currentURL)URL.revokeObjectURL(currentURL);currentURL=URL.createObjectURL(m.blob);$('previewVideo').src=currentURL;hardenMediaVideo($('previewVideo'));$('emptyPreview').style.display='none';$('previewStatus').textContent=m.name;$('previewVideo').load();$('previewVideo').play().catch(()=>{})}
 async function saveState(){const startSec=Math.max(0,+$('audioStart').value||0),endSec=Math.max(0,+$('audioEnd').value||0);state.settings={...state.settings,language:$('language').value,voice:$('voice').value,rate:+$('speed').value,pitch:+$('pitch').value,origVol:+$('origVol').value,addVol:+$('addVol').value,start:startSec,end:endSec,musicVol:+$('musicVol').value,timelineZoom,playheadMs:timelinePlayheadMs};if(state.audio){state.audio.start=Math.round(startSec*1000);state.audio.duration=Number(state.audio.duration||state.audio.end||0);state.audio.endPadding=Math.round(endSec*1000);state.audio.end=state.audio.duration;state.audio.volume=+$('addVol').value||100}await AVDB.put('projects',{id:'current',name:state.name,timeline:state.timeline,selected:state.selected,audio:state.audio,srt:state.srt||null,music:state.music,settings:state.settings});$('projectName').textContent=state.name}
+function parseMp3DurationFromBuffer(buffer){
+  try{
+    const bytes=new Uint8Array(buffer);
+    if(bytes.length<4)return 0;
+    let pos=0;
+    // Skip ID3v2 tag when present.
+    if(bytes.length>=10 && bytes[0]===0x49 && bytes[1]===0x44 && bytes[2]===0x33){
+      const size=((bytes[6]&0x7f)<<21)|((bytes[7]&0x7f)<<14)|((bytes[8]&0x7f)<<7)|(bytes[9]&0x7f);
+      pos=10+size+((bytes[5]&0x10)?10:0);
+    }
+    const bitratesV1={
+      1:[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320],
+      2:[0,8,16,24,32,40,48,56,64,80,96,112,128,144,160]
+    };
+    const sampleRates={
+      0:[44100,48000,32000],
+      1:[22050,24000,16000],
+      2:[11025,12000,8000]
+    };
+    let frames=0, bytesTotal=0, firstBitrate=0, sampleRate=0, samplesTotal=0;
+    for(let i=pos;i+4<bytes.length && frames<200000;){
+      if(bytes[i]!==0xff || (bytes[i+1]&0xe0)!==0xe0){i++;continue;}
+      const b1=bytes[i+1], b2=bytes[i+2], b3=bytes[i+3];
+      const versionBits=(b1>>3)&3;
+      const layer=(b1>>1)&3;
+      const bitrateIndex=(b2>>4)&15;
+      const srIndex=(b2>>2)&3;
+      if(layer!==1 || bitrateIndex===0 || bitrateIndex===15 || srIndex===3){i++;continue;}
+      const version=versionBits===3?1:(versionBits===2?2:0);
+      if(!version){i++;continue;}
+      const kbps=bitratesV1[version][bitrateIndex];
+      const sr=sampleRates[version===1?0:(version===2?1:2)][srIndex];
+      if(!kbps||!sr){i++;continue;}
+      const padding=(b2>>1)&1;
+      const channelMode=(b3>>6)&3;
+      const samplesPerFrame=version===1?1152:576;
+      const frameLen=version===1?Math.floor(144*kbps*1000/sr)+padding:Math.floor(72*kbps*1000/sr)+padding;
+      if(frameLen<24 || i+frameLen>bytes.length){i++;continue;}
+      if(!firstBitrate)firstBitrate=kbps;
+      sampleRate=sr;
+      frames++;
+      bytesTotal+=frameLen;
+      samplesTotal+=samplesPerFrame;
+      i+=frameLen;
+      // Once a valid sequence is established, avoid scanning an enormous blob unnecessarily.
+      if(frames>=100 && bytesTotal>1024*1024 && i>bytes.length-4096)break;
+    }
+    if(!frames||!sampleRate)return 0;
+    // Frame/sample count is the most reliable fallback for CBR/VBR streams.
+    const byFrames=samplesTotal/sampleRate;
+    if(Number.isFinite(byFrames)&&byFrames>0)return byFrames;
+    if(firstBitrate)return (bytes.length-pos)*8/(firstBitrate*1000);
+  }catch(e){console.warn('MP3 duration parser failed',e)}
+  return 0;
+}
+
 async function mediaDuration(file){
-  return new Promise(resolve=>{
-    const isVideo=(file.type||'').startsWith('video/') || /\.(mp4|webm|mov|mkv|m4v|avi)$/i.test(file.name);
+  if(!file)return 0;
+  const blob=file instanceof Blob?file:new Blob([file]);
+  // Fast path: browser media metadata.
+  const browserDuration=await new Promise(resolve=>{
+    const isVideo=(file.type||'').startsWith('video/') || /\.(mp4|webm|mov|mkv|m4v|avi)$/i.test(file.name||'');
     const el=document.createElement(isVideo?'video':'audio');
-    const u=URL.createObjectURL(file); let settled=false;
-    const finish=d=>{if(settled)return;settled=true;clearTimeout(timer);URL.revokeObjectURL(u);el.removeAttribute('src');try{el.load()}catch{}resolve(Math.round((Number.isFinite(d)?d:0)*1000))};
-    const timer=setTimeout(()=>finish(0),7000);
-    el.preload='metadata';el.onloadedmetadata=()=>finish(el.duration||0);el.onerror=()=>finish(0);el.src=u;
+    const u=URL.createObjectURL(blob); let settled=false;
+    const finish=d=>{if(settled)return;const n=Number(d);if(Number.isFinite(n)&&n>0){settled=true;cleanup();resolve(n*1000)}};
+    const cleanup=()=>{clearTimeout(timer);el.onloadedmetadata=null;el.ondurationchange=null;el.onerror=null;URL.revokeObjectURL(u);try{el.removeAttribute('src');el.load()}catch{}};
+    const timer=setTimeout(()=>{if(!settled){settled=true;cleanup();resolve(0)}},10000);
+    el.preload='metadata';
+    el.onloadedmetadata=()=>finish(el.duration);
+    el.ondurationchange=()=>finish(el.duration);
+    el.onerror=()=>{if(!settled){settled=true;cleanup();resolve(0)}};
+    el.src=u;
+    try{el.load()}catch{}
   });
+  if(browserDuration)return Math.round(browserDuration);
+
+  // Reliable fallback for generated Edge TTS MP3 and imported MP3 files.
+  const type=(file.type||'').toLowerCase(),name=(file.name||'').toLowerCase();
+  if(type.includes('mpeg')||type.includes('mp3')||/\.mp3$/i.test(name)){
+    const buffer=await blob.arrayBuffer();
+    const parsed=parseMp3DurationFromBuffer(buffer);
+    if(parsed)return Math.round(parsed*1000);
+  }
+
+  // Final fallback for browser-decodable formats where metadata was delayed.
+  try{
+    const C=window.AudioContext||window.webkitAudioContext;
+    if(C){
+      const ctx=new C();
+      const decoded=await ctx.decodeAudioData(await blob.arrayBuffer());
+      const d=Number(decoded?.duration)||0;
+      try{await ctx.close()}catch{}
+      if(Number.isFinite(d)&&d>0)return Math.round(d*1000);
+    }
+  }catch(e){console.warn('Audio decode fallback failed',e)}
+  return 0;
 }
 function fileKind(file){
   const t=(file.type||'').toLowerCase(),n=file.name.toLowerCase();
